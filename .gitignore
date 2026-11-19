@@ -1,18 +1,15 @@
-# IntelliJ configuration
+# Local IntelliJ and Java build products
 .idea/
 *.iml
-
-# Compiled Java files
 out/
 *.class
 
-# Temporary files
-*.tmp
+# Logs generated from repeated tests
 *.log
 
-# Historical reference solution
-reference_2023/
-
-# Local environment and credentials
+# Secrets; no credentials should be committed
 .env
 .env.*
+
+# Old homework examples should not be included in the 2026 project
+reference_2023/

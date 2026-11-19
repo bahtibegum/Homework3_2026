@@ -1,92 +1,76 @@
-# Advanced Databases – Homework 3 (2026): revised Java/PostgreSQL solution
+# Advanced Databases — Homework 3 (2026)
 
-**Status:** Java 21 compilation and a 100,000-transaction generator self-test **passed** in the preparation environment. **PostgreSQL execution, performance results, query plans and profiling were not tested here** because no running PostgreSQL server was available. Execute the experiment matrix on your machine before submission. This is a working **implementation draft**, not a verified final lab submission with measured results.
+**New optimization trial (18 November):** Read `OPTIMIZATION_TRIAL_README.md` before running the new `roundtrip` mode; this original README covers the earlier fixed project and the `optimized` JDBC-batch variant.
 
-## What was wrong with the supplied `group1_homework3.zip`?
 
-The archive contains a **2023** solution (old report dated 22 November 2023), not the new 2026 assignment. The historical code uses mostly write-only range updates, a fixed number of tasks, and execution-time comparisons. Some variants hard-code the worker pool size or print results from historical machines. The 2026 task explicitly requires a different workload, continuous execution, throughput measurement, and a serial baseline.
+## Status — code fixes made, PostgreSQL re-test required
 
-## Mapping to the 2026 marking criteria
+The **Java 21 build and offline tests pass** after these fixes. The attached `results/benchmarks_before_fixes.csv` contains the user's genuine **16 November 2026** PostgreSQL results, which were produced **before** the changes. They are not performance results for this version. **Run the benchmark matrix again on the same Windows/PostgreSQL setup before claiming a gain.** No PowerPoint file was modified.
 
-| 2026 requirement | Where addressed | Evidence / remaining action |
-| --- | --- | --- |
-| Generate p independently for each transaction | `Workload.make` | Deterministic pseudorandom per-transaction stream; self-test passed |
-| 60% three distinct point reads; sum printed after commit | `Workload.POINT_READ`, `Benchmark.runStatements` | 3 separate prepared `SELECT data_value ... WHERE data_id = ?` queries |
-| 10% INSERT; clean up on restart | `Workload.INSERT`, `Database.reset` | Insert unique new rows; **`--reset` truncates and reseeds** before each run |
-| 10% full-table read sum | `Workload.FULL_SCAN` | One `SELECT sum(data_value) FROM blocking_data` |
-| 20% write query; three single-tuple updates | `Workload.WRITE` | Three `UPDATE ... WHERE data_id = ?`, same random order on retry |
-| Continuous stream; explain equilibrium | `Worker.loop` | Fixed N workers: each completes one transaction and immediately generates the next; active work stays bounded by N, no unbounded queue |
-| Throughput and scaling | `Benchmark.printAndStore`, `scripts/run_matrix.*` | Committed transactions / elapsed seconds, 1/2/4/8 workers; **run actual measurements** |
-| 30-second live demo | `--duration 30` | Progress logs + per-read sums; **record your own actual demo** |
-| Serial execution baseline | `--mode serial` | Exactly one worker, same workload generator |
-| Find bottlenecks with Java/Postgres tools | `scripts/inspect_db.sql` and report template | Explain plans and suggested analysis; **collect real profiler and server evidence** |
-| Improve bottlenecks | `--mode optimized` | Per-worker prepared-statement reuse instead of preparing for every transaction; **measure whether it actually helps** |
-| Compare results, surprises, challenges, contributions and slides | `results/REPORT_TEMPLATE.md`, `slides_2026_template.pptx` | Fill real benchmark numbers, observations, screenshots and contributions before submitting |
+The professor requires a continuous 60/10/10/20 transaction mix, a serial baseline, scaling tests, performance evidence, an improvement and a talk. This project implements the workload, closed-loop worker stream, retry behavior, serial/concurrent and experimental prepared-statement reuse modes. Additional work on profiling and presentation is described in `FIXES_AND_TESTS.md`.
 
-## Important behavioral details
+## Changes in this version
 
-- **Only these four workloads occur:** POINT_READ (p < 0.60), INSERT (0.60 ≤ p < 0.70), FULL_SCAN (0.70 ≤ p < 0.80), WRITE (p ≥ 0.80). Observed fractions vary around target fractions due to sampling.
-- All point selects and updates use **three distinct keys from the 50,000 base tuples**. This ensures each returns/updates an existing tuple, including during concurrent inserts. Inserts are visible to full-table scans and are removed at reset, but are not sampled by the point-read key generator. This is a workload-design simplification worth disclosing in the presentation.
-- Every worker uses its **own JDBC connection** and a transaction with `autoCommit=false` and `READ COMMITTED`. Read-only transactions are explicitly committed too.
-- `SQLSTATE 40P01` (deadlock), `40001` (serialization), and `55P03` (lock unavailable) cause **rollback + randomized exponential backoff + retry of the same transaction plan**. Other SQL errors are reported and stop the benchmark instead of silently counting an uncommitted task.
-- The 3 writes stay in their generated order, as the assignment explicitly forbids canonical locking.
-- When the requested generation time expires, started transactions **drain to commit**; actual measured elapsed time includes this drain. Table initialization and initial JDBC connection creation are excluded.
-- An `INSERT` uses a unique integer key `baseRows + transactionId`; a `--reset` eliminates all previous inserted rows. The program **requires `--reset`** before each benchmark, to prevent contamination from prior inserts. Beware: it **DELETES ALL `blocking_data` ROWS**.
-- `--print-reads true` (default) outputs each point-read/full-scan sum to standard output after a successful commit. For repeatable measurements, redirect output to a log file (script already does this); the assignment's console output requirement is preserved. Setting it to false is a diagnostics-only option and is **not compliant** with the demonstration requirement.
+1. **Inserted rows become eligible for point reads and updates.** A thread-safe `InsertedRows` registry is populated only *after* successful INSERT commits. Each point-read or write transaction samples three distinct IDs uniformly from the original rows **and all INSERT rows currently published as committed**. It preserves the random key order. No missing/uncommitted row can be chosen. The 60/10/10/20 transaction type is still generated deterministically for each transaction ID, but the exact key sample can differ between concurrent runs because commit timing varies.
+2. **Deadlock integration test added.** `homework3.DeadlockTest` deliberately creates a deadlock on a separate temporary-purpose table, verifies rollback and retry of the same two-update plan, and verifies both transactions eventually commit. It uses the same SQLSTATE classification and randomized backoff helper as the benchmark. **It has not been run against your PostgreSQL yet.**
+3. **Experimental optimization adjusted.** The `optimized` mode now **batches its three ordered, single-tuple UPDATE statements with JDBC `addBatch/executeBatch`**, reducing client/server round trips without changing SQL or write-key order. It also reuses client-side JDBC prepared statements and sets pgJDBC's `prepareThreshold=0` to avoid named server-side prepared statements/generic plans. These are **hypotheses**, not proven speed-ups. The ordinary `concurrent` mode remains a valid and historically faster baseline. Do not label the change effective unless your new measurements show that.
+4. **Benchmark script now records post-fix measurements separately**, in `results/benchmarks_after_fixes.csv`. It leaves the old CSV intact. This is important because the row-sampling rules changed.
+5. **Old `reference_2023` folder removed** from the package. If older code was consulted/adapted, disclose it and any AI help as required by the professor; removing a folder does not change attribution requirements.
 
-## Run on Windows (Java 21, IntelliJ, PostgreSQL)
+## Windows — IntelliJ IDEA / PowerShell / PostgreSQL 18
 
-1. Ensure PostgreSQL is running and a database exists, e.g. `task2_db`. Use the existing one only if you accept resetting its `blocking_data` table.
-2. Use **Java 21** (works with the bundled PostgreSQL JDBC `42.6.0` driver) and PowerShell inside the unzipped project folder.
-3. Set the database connection environment variables for your current PowerShell session (replace examples with real settings):
+Open **this extracted project folder** in IntelliJ, using Java 21. In IntelliJ's terminal, set the PostgreSQL connection (replace `YOUR_PASSWORD`; port 5434 matched your last known setup):
 
 ```powershell
-$env:PG_URL = 'jdbc:postgresql://localhost:5434/task2_db'
+$env:PG_URL = 'jdbc:postgresql://localhost:5434/homework3_2026'
 $env:PG_USER = 'postgres'
-$env:PG_PASSWORD = 'YOUR_POSTGRES_PASSWORD'
+$env:PG_PASSWORD = 'YOUR_PASSWORD'
 .\scripts\build.ps1
 ```
 
-4. First short **live database test** (writes results to `results/benchmarks.csv`):
+**PostgreSQL deadlock integration test** (does not change `blocking_data`):
 
 ```powershell
-java -cp 'out;lib/*' homework3.Main --mode optimized --threads 4 --duration 5 --reset
+java -cp 'out;lib/*' homework3.DeadlockTest
 ```
 
-5. Compare the strategies with the **full 30-second matrix** and fresh table for every experiment:
+Expected (after PostgreSQL's deadlock detection delay): `PASS: PostgreSQL deadlock triggered (...) ... both transactions committed.` It creates and removes only `homework3_deadlock_test`; do not run alongside other tests using that name.
+
+**Five-second smoke test on a dedicated database**:
+
+```powershell
+java -cp 'out;lib/*' homework3.Main --mode concurrent --threads 4 --duration 5 --reset --csv results/smoke_after_fixes.csv
+```
+
+**Full 30-second benchmark matrix** (seven runs):
 
 ```powershell
 .\scripts\run_matrix.ps1
 ```
 
-Results will be appended to `results/benchmarks.csv`. Console read sums are captured into `results/*_read_sums.log`. To avoid mixing previous experiments, delete or rename the existing CSV before a complete new matrix. You can perform a controlled comparison of **exactly the same set of transaction plans** with `--duration 0 --transactions 10000 --reset` for each mode, in addition to the continuous-stream benchmarks.
+This writes `results/benchmarks_after_fixes.csv` and redirects the required completed read-query sums to `results/*_after_fixes_read_sums.log`. To keep a clean matrix, rename/delete any existing `benchmarks_after_fixes.csv` *before* running the script again. The benchmark table is truncated and reloaded before **every** run.
 
-## Run on Linux / macOS
+### Safety warning
 
-```bash
-export PG_URL='jdbc:postgresql://localhost:5432/task2_db'
-export PG_USER='postgres'
-export PG_PASSWORD='YOUR_POSTGRES_PASSWORD'
-./scripts/build.sh
-java -cp 'out:lib/*' homework3.Main --mode optimized --threads 4 --duration 30 --reset
-./scripts/run_matrix.sh
-```
+`--reset` **TRUNCATES ALL `blocking_data` ROWS** in the selected database. Use only your dedicated `homework3_2026` database. Do not run it against data you need to keep. Passwords are supplied through environment variables; do not put them in Git.
 
-## How to interpret results
+## What to measure and report
 
-- `throughput_per_second = committed / actual_seconds`; every transaction type is included.
-- **Relative speedup** for an N-thread variant = variant throughput / one-thread serial throughput.
-- More workers does **not** guarantee linear scaling: PostgreSQL scans, row-lock waiting, server CPU/I/O, client console output and JDBC calls may limit speed.
-- `concurrent` (non-caching) creates the SQL prepared statement for **each transaction**; `optimized` reuses four prepared statements per worker. Both use the same SQL semantics. The actual benefit needs measurement. This change primarily targets client/parse overhead rather than insert initialization or JDBC connection creation.
-- `results/REPORT_TEMPLATE.md` describes a profiling/evidence workflow, possible unexpected outcomes, and the mandatory presentation content.
+- **Throughput** = committed transactions / elapsed seconds (including any in-flight drain).
+- **Speed-up** = concurrent/optimized throughput divided by serial throughput.
+- Compare two, four and eight worker threads, including changes in latency and diminishing returns.
+- Describe the closed-loop equilibrium: `N` workers each finish one transaction and immediately start another; no unbounded queue.
+- The 2026 code targets serial execution as a bottleneck using concurrent workers; historical concurrent-8 yielded **5,899.014 tx/s** versus serial-1 **2,149.984 tx/s**, but those were **pre-fix** readings. The older `optimized` cache implementation was *slower* than ordinary concurrent. The new optimization trial is unverified.
+- See `results/EXPLAIN_RESULTS_2026.md` for PostgreSQL plans that you captured, and `FIXES_AND_TESTS.md` for open checks.
+- If you reuse an idea or code from an older project or AI, acknowledge it appropriately, as the assignment allows with attribution and licensing.
 
-## Submission and academic attribution
+## Files
 
-**Do not submit the legacy 2023 PDF or PPTX as 2026 evidence.** Those files remain in your original uploaded ZIP, and are not copied into this updated submission package. This revised Java solution was reimplemented while inspecting the supplied archive; disclose use of the old student example and any AI assistance in your talk, and comply with your course's citation/licensing requirements. The original archive reports Begüm Tosun, Partow Moradi Khushkanab and Anton Urbanek as its 2023 authors, and old Java sources reproduce an MIT-style original-source permission notice. Do not claim other people's measurements, screenshots, contributions, or presentations as your own. Fill your **actual team-member contributions (%)** on the slide template.
-
-## Known limits / outstanding work
-
-- This environment did not provide a PostgreSQL server, so no live JDBC integration test, SQL `EXPLAIN ANALYZE` output, profiler screenshots or honest throughput figures can be supplied yet.
-- The `optimized` solution is a concrete candidate improvement; if benchmarks show negligible gains, profile and refine it and explain the actual outcome. The professor evaluates the measured evidence and explanation, not just compiling Java.
-- Both strategies are safe under the listed recoverable transaction errors; a nonrecoverable DB/permission/network error aborts visibly. This is preferable to falsely reporting all transactions as committed.
-- With large numbers of inserts, `data_id` INTEGER eventually limits the transaction ID range; irrelevant to ordinary 30-second tests but avoid indefinite multi-day runs without reset.
+- `src/homework3/` — 2026 implementation and Java self-test + live deadlock test
+- `scripts/build.ps1` / `scripts/run_matrix.ps1` — build and run benchmark
+- `scripts/inspect_db.sql` — EXPLAIN/PostgreSQL inspection queries
+- `results/benchmarks_before_fixes.csv` — **old measured results only**
+- `results/REPORT_2026_BEFORE_FIXES.md` — previous measured analysis, not a post-fix claim
+- `results/EXPLAIN_RESULTS_2026.md` — real SQL plan observations from your screenshots
+- `FIXES_AND_TESTS.md` — what changed, which checks remain
+- `slides_2026_measured.pptx`, `slides_2026_template.pptx` — **unchanged**; update later with your group

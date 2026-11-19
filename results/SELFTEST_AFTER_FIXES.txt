@@ -1,0 +1,1 @@
+PASS: 100000 reproducible plans, distinct keys, mix: reads=60063, inserts=9984, scans=9864, writes=20089

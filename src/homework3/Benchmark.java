@@ -18,12 +18,10 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Continuous workload: one worker commits (or retries) a transaction, then immediately starts
@@ -40,6 +38,7 @@ final class Benchmark {
             "retry_attempts,deadlocks,serialization_failures,lock_not_available,avg_latency_ms,max_latency_ms";
 
     private final Config cfg;
+    private final InsertedRows insertedRows;
     private final AtomicLong issued = new AtomicLong();
     private final LongAdder committed = new LongAdder();
     private final LongAdder pointReads = new LongAdder();
@@ -56,7 +55,10 @@ final class Benchmark {
     private volatile long startNs;
     private volatile long deadlineNs;
 
-    Benchmark(Config cfg) { this.cfg = cfg; }
+    Benchmark(Config cfg) {
+        this.cfg = cfg;
+        this.insertedRows = new InsertedRows(cfg.rows());
+    }
 
     void execute() throws Exception {
         List<Worker> workers = new ArrayList<>();
@@ -127,6 +129,7 @@ final class Benchmark {
         private final int workerId;
         private final Connection c;
         private final EnumMap<Workload.Kind, PreparedStatement> cache = new EnumMap<>(Workload.Kind.class);
+        private final java.sql.Statement multiStatement;
 
         Worker(int workerId) throws SQLException {
             this.workerId = workerId;
@@ -135,8 +138,21 @@ final class Benchmark {
             // READ COMMITTED provides PostgreSQL MVCC reads and row-level write conflicts.
             // SERIALIZABLE is not a requirement here and can add serialization failures.
             c.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
-            if (cfg.mode().equals("optimized")) {
+            if (cfg.mode().equals("optimized") || cfg.mode().equals("cached")) {
+                // Cached mode reuses one PreparedStatement per SQL query kind, with normal
+                // individual UPDATE execution and default PostgreSQL server-prepare settings.
+                // Legacy experimental variant: JDBC batching with client-side cached statements.
                 for (Workload.Kind k : Workload.Kind.values()) cache.put(k, c.prepareStatement(sql(k)));
+            }
+            if (cfg.mode().equals("roundtrip")) {
+                // The candidate variant reuses prepared statements for the unchanged one-statement
+                // INSERT/SCAN transactions, while sending the three independent ordered SELECT
+                // or UPDATE statements in one JDBC execute() call.
+                cache.put(Workload.Kind.INSERT, c.prepareStatement(INSERT));
+                cache.put(Workload.Kind.FULL_SCAN, c.prepareStatement(SCAN));
+                multiStatement = c.createStatement();
+            } else {
+                multiStatement = null;
             }
         }
 
@@ -144,13 +160,17 @@ final class Benchmark {
             while (error.get() == null && System.nanoTime() < deadlineNs) {
                 long id = issued.getAndIncrement();
                 if (cfg.transactions() > 0 && id >= cfg.transactions()) break;
-                Workload.Tx tx = Workload.make(id, cfg.seed(), cfg.rows());
+                Workload.Tx tx = Workload.make(id, cfg.seed(), cfg.rows(), insertedRows);
                 long began = System.nanoTime();
                 int attempt = 0;
                 while (true) { // A started transaction MUST eventually commit or fail visibly.
                     try {
                         double result = runStatements(tx);
                         c.commit();
+                        // Publish the INSERT only after commit; other workers can then sample it.
+                        if (tx.kind() == Workload.Kind.INSERT) {
+                            insertedRows.publishedCommit(tx.insertionId());
+                        }
                         long latency = System.nanoTime() - began;
                         totalLatencyNs.add(latency);
                         maxLatencyNs.accumulateAndGet(latency, Math::max);
@@ -172,17 +192,15 @@ final class Benchmark {
                             ex.addSuppressed(rollbackError);
                             throw ex;
                         }
-                        String sqlState = ex.getSQLState();
-                        if (!isRetryable(sqlState)) throw ex;
+                        String sqlState = RetryPolicy.retryableState(ex);
+                        if (sqlState == null) throw ex;
                         retries.increment();
                         if ("40P01".equals(sqlState)) deadlocks.increment();
                         if ("40001".equals(sqlState)) serialization.increment();
                         if ("55P03".equals(sqlState)) locks.increment();
                         attempt++;
                         // Exponential randomized backoff prevents synchronized retry/live-lock.
-                        long capMs = Math.min(200, 2L << Math.min(7, attempt));
-                        long sleepMs = ThreadLocalRandom.current().nextLong(1, capMs + 1);
-                        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(sleepMs));
+                        RetryPolicy.backoff(attempt);
                         if (Thread.currentThread().isInterrupted()) {
                             throw new IllegalStateException("Worker interrupted while retrying", ex);
                         }
@@ -192,6 +210,15 @@ final class Benchmark {
         }
 
         double runStatements(Workload.Tx tx) throws SQLException {
+            if (multiStatement != null) {
+                if (tx.kind() == Workload.Kind.POINT_READ) {
+                    return RoundTrip.pointRead(multiStatement, tx.dataIds());
+                }
+                if (tx.kind() == Workload.Kind.WRITE) {
+                    RoundTrip.updateThree(multiStatement, tx);
+                    return Double.NaN;
+                }
+            }
             PreparedStatement ps = cache.get(tx.kind());
             boolean temporary = ps == null;
             if (temporary) ps = c.prepareStatement(sql(tx.kind()));
@@ -223,13 +250,32 @@ final class Benchmark {
                         }
                     }
                     case WRITE -> {
-                        // Three separate UPDATE statements, each WHERE data_id = one single row.
-                        // Preserve chosen key order (do NOT canonicalize lock acquisition).
-                        for (int i = 0; i < 3; i++) {
-                            ps.setDouble(1, tx.values()[i]);
-                            ps.setInt(2, Math.toIntExact(tx.id() % Integer.MAX_VALUE));
-                            ps.setInt(3, tx.dataIds()[i]);
-                            exactlyOne(ps.executeUpdate(), "UPDATE");
+                        // Three distinct single-tuple UPDATE statements, in the original random
+                        // order. Optimized mode batches them at the JDBC protocol layer to avoid
+                        // three independent client/server round trips. JDBC keeps batch order.
+                        if (cfg.mode().equals("optimized")) {
+                            ps.clearBatch();
+                            try {
+                                for (int i = 0; i < 3; i++) {
+                                    ps.setDouble(1, tx.values()[i]);
+                                    ps.setInt(2, Math.toIntExact(tx.id() % Integer.MAX_VALUE));
+                                    ps.setInt(3, tx.dataIds()[i]);
+                                    ps.addBatch();
+                                }
+                                int[] counts = ps.executeBatch();
+                                if (counts.length != 3) throw new SQLException("UPDATE batch count mismatch");
+                                for (int changed : counts) exactlyOne(changed, "UPDATE");
+                            } finally {
+                                // Important after any failed attempt: never retry a stale batch.
+                                ps.clearBatch();
+                            }
+                        } else {
+                            for (int i = 0; i < 3; i++) {
+                                ps.setDouble(1, tx.values()[i]);
+                                ps.setInt(2, Math.toIntExact(tx.id() % Integer.MAX_VALUE));
+                                ps.setInt(3, tx.dataIds()[i]);
+                                exactlyOne(ps.executeUpdate(), "UPDATE");
+                            }
                         }
                         return Double.NaN;
                     }
@@ -241,17 +287,17 @@ final class Benchmark {
         }
 
         @Override public void close() throws SQLException {
-            for (PreparedStatement ps : cache.values()) ps.close();
-            if (!c.isClosed()) c.close();
+            try {
+                if (multiStatement != null) multiStatement.close();
+                for (PreparedStatement ps : cache.values()) ps.close();
+            } finally {
+                if (!c.isClosed()) c.close();
+            }
         }
     }
 
     private static void exactlyOne(int affected, String operation) throws SQLException {
         if (affected != 1) throw new SQLException(operation + " changed " + affected + " rows (expected 1)");
-    }
-
-    private static boolean isRetryable(String state) {
-        return "40P01".equals(state) || "40001".equals(state) || "55P03".equals(state);
     }
 
     private static String sql(Workload.Kind kind) {

@@ -10,6 +10,11 @@ public final class Workload {
     private Workload() { }
 
     public static Tx make(long id, long seed, int initialRows) {
+        return make(id, seed, initialRows, null);
+    }
+
+    /** With a registry, read/write keys include all committed INSERT rows as they become visible. */
+    static Tx make(long id, long seed, int initialRows, InsertedRows insertedRows) {
         // A separate pseudorandom stream for each transaction: retries NEVER change its operation.
         SplittableRandom rng = new SplittableRandom(seed ^ mix64(id));
         double p = rng.nextDouble(); // [0, 1)
@@ -17,7 +22,8 @@ public final class Workload {
                 : p < 0.70 ? Kind.INSERT
                 : p < 0.80 ? Kind.FULL_SCAN : Kind.WRITE;
         int[] keys = (kind == Kind.POINT_READ || kind == Kind.WRITE)
-                ? threeDistinct(rng, initialRows) : new int[0];
+                ? (insertedRows == null ? threeDistinct(rng, initialRows) : insertedRows.threeDistinct(rng))
+                : new int[0];
         double[] values = new double[3];
         for (int j = 0; j < values.length; j++) values[j] = rng.nextDouble(0.0, 50.0);
         // Using a transaction-derived key avoids concurrent INSERT key collisions, and --reset

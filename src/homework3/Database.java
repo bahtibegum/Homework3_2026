@@ -18,6 +18,11 @@ final class Database {
         props.setProperty("password", c.password());
         props.setProperty("ApplicationName", "HW3_2026_" + c.mode());
         props.setProperty("reWriteBatchedInserts", "true");
+        if (c.mode().equals("optimized")) {
+            // Cache PreparedStatement objects in the client without switching to server-side
+            // named statements/generic plans. Compare empirically with the standard mode.
+            props.setProperty("prepareThreshold", "0");
+        }
         return DriverManager.getConnection(c.jdbcUrl(), props);
     }
 

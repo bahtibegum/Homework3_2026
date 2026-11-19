@@ -31,8 +31,8 @@ public record Config(String mode, int threads, int rows, int durationSeconds,
             }
         }
         String mode = opts.getOrDefault("mode", "optimized").toLowerCase();
-        if (!java.util.Set.of("serial", "concurrent", "optimized").contains(mode)) {
-            throw new IllegalArgumentException("Mode must be serial, concurrent, or optimized");
+        if (!java.util.Set.of("serial", "concurrent", "optimized", "roundtrip", "cached").contains(mode)) {
+            throw new IllegalArgumentException("Mode must be serial, concurrent, optimized, roundtrip, or cached");
         }
         int threads = Integer.parseInt(opts.getOrDefault("threads", "4"));
         if (mode.equals("serial")) threads = 1;
@@ -44,7 +44,7 @@ public record Config(String mode, int threads, int rows, int durationSeconds,
                 || duration < 0 || transactions < 0 || (duration == 0 && transactions == 0)) {
             throw new IllegalArgumentException("Invalid threads/rows/duration/transactions setting");
         }
-        String url = opts.getOrDefault("url", env("PG_URL", "jdbc:postgresql://localhost:5434/task2_db"));
+        String url = opts.getOrDefault("url", env("PG_URL", "jdbc:postgresql://localhost:5434/homework3_2026"));
         String user = opts.getOrDefault("user", env("PG_USER", "postgres"));
         String password = System.getenv().getOrDefault("PG_PASSWORD", "");
         boolean printReads = Boolean.parseBoolean(opts.getOrDefault("print-reads", "true"));
@@ -61,15 +61,19 @@ public record Config(String mode, int threads, int rows, int durationSeconds,
         System.out.println("""
                 Homework 3 (2026) - PostgreSQL continuous transaction benchmark
                 java -cp "out:lib/*" homework3.Main [options]
-                --mode serial|concurrent|optimized    serial=1 worker; concurrent=prepare each tx;
-                                                      optimized=reuse per-worker prepared statements
+                --mode serial|concurrent|optimized|roundtrip|cached
+                                                      serial=1 worker; concurrent=prepare each tx;
+                                                      cached=reuse prepared statements without batching;
+                                                      optimized=earlier JDBC update-batch experiment;
+                                                      roundtrip=three separate ordered SQL statements
+                                                      delivered together in one JDBC call
                 --threads N                           worker count (ignored in serial mode)
                 --rows N                              initial tuples (default 50000)
                 --duration N                          new transactions for N seconds (default 30)
                 --transactions N                      optional cap (default 0 = unlimited)
                 --seed N                              deterministic workload seed
                 --reset                               CAUTION: TRUNCATES blocking_data and reseeds it
-                --url jdbc:postgresql://...           override PG_URL; default localhost:5434/task2_db
+                --url jdbc:postgresql://...           override PG_URL; default localhost:5434/homework3_2026
                 --user NAME                           override PG_USER; default postgres
                 --csv PATH                            output CSV (default results/benchmarks.csv)
                 --print-reads true|false              true required for assignment demo
